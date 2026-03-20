@@ -7,11 +7,15 @@ from typing import Optional
 import joblib
 import numpy as np
 import pandas as pd
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
-from flask import Flask, jsonify, request as flask_request, render_template_string
 from pydantic import BaseModel, Field
+
+from models.deep_path import run_deep_path
+from models.trust_entropy import compute_trust_entropy
+from models.lstm_sequential import load_lstm_scorer
+from models.gnn_link_predictor import load_gnn_scorer
 
 warnings.filterwarnings("ignore")
 
@@ -44,6 +48,22 @@ def _load_models():
 
 
 lgbm_pipeline, xgb_model, isolation_model = _load_models()
+
+
+# ---------------------------------------------------------------------------
+# Deep Path model loading (graceful — returns None if artefacts missing)
+# ---------------------------------------------------------------------------
+lstm_scorer = load_lstm_scorer(BASE_DIR)
+gnn_scorer = load_gnn_scorer(BASE_DIR)
+
+if lstm_scorer and gnn_scorer:
+    print("[Deep Path] LSTM + GraphSAGE models loaded successfully.")
+elif lstm_scorer:
+    print("[Deep Path] Only LSTM loaded (GraphSAGE artefacts missing).")
+elif gnn_scorer:
+    print("[Deep Path] Only GraphSAGE loaded (LSTM artefacts missing).")
+else:
+    print("[Deep Path] No deep-path models found — detective layer disabled.")
 
 
 # ---------------------------------------------------------------------------
@@ -224,10 +244,10 @@ def _compute_anomaly_probability(features_14: np.ndarray, data: dict) -> float:
 
 def ensemble_predict(data: dict) -> dict:
     """
-    Run all three models and combine into a weighted ensemble.
-
-    Returns a rich result dictionary with per-model scores and the final
-    ensemble verdict.
+    Run the Fast Path models, conditionally invoke the Deep Path (LSTM +
+    GraphSAGE) when the fast-path score is in the Medium band, compute
+    Trust Entropy over all contributing models, and return a rich result
+    dictionary.
     """
     features = preprocess_input(data)
 
@@ -242,20 +262,38 @@ def ensemble_predict(data: dict) -> dict:
     xgb_label = int(xgb_prob >= 0.5)
 
     # --- EllipticEnvelope (anomaly detection) ---
-    # Raw model output (note: feature alignment is approximate)
     iso_input = features["iso_features"].reshape(1, -1)
     iso_raw_score = float(isolation_model.decision_function(iso_input)[0])
     iso_raw_label = int(isolation_model.predict(iso_input)[0] == -1)
-    # Heuristic probability from known risk signals
     iso_prob = _compute_anomaly_probability(features["lgbm_features"], data)
     iso_label = int(iso_prob >= 0.5)
 
-    # --- weighted ensemble ---
-    ensemble_score = (
+    # --- Fast Path weighted ensemble ---
+    fast_path_score = (
         WEIGHTS["lgbm"] * lgbm_prob
         + WEIGHTS["xgboost"] * xgb_prob
         + WEIGHTS["isolation"] * iso_prob
     )
+
+    # --- Deep Path (Detective layer) ---
+    user_id = data.get("user_id")
+    resource_id = data.get("resource_id")
+    device_type = str(data.get("device_type", "unknown")).lower()
+
+    deep_result = run_deep_path(
+        fast_path_score=fast_path_score,
+        user_id=user_id,
+        resource_id=resource_id,
+        device_type=device_type,
+        lstm_scorer=lstm_scorer,
+        gnn_scorer=gnn_scorer,
+    )
+
+    if deep_result["triggered"] and deep_result["blended_score"] is not None:
+        ensemble_score = deep_result["blended_score"]
+    else:
+        ensemble_score = fast_path_score
+
     ensemble_label = int(ensemble_score >= 0.5)
 
     risk_level = (
@@ -265,12 +303,25 @@ def ensemble_predict(data: dict) -> dict:
         else "Low"
     )
 
-    return {
+    # --- Trust Entropy (model disagreement) ---
+    entropy_inputs = [lgbm_prob, xgb_prob, iso_prob]
+    if deep_result["triggered"]:
+        if deep_result["lstm_risk"] is not None:
+            entropy_inputs.append(deep_result["lstm_risk"])
+        if deep_result["gnn_risk"] is not None:
+            entropy_inputs.append(deep_result["gnn_risk"])
+
+    uncertainty_score, uncertainty_level = compute_trust_entropy(entropy_inputs)
+
+    # --- Build response ---
+    result = {
         "ensemble": {
             "risk_score": round(ensemble_score, 4),
             "prediction": ensemble_label,
             "risk_level": risk_level,
             "verdict": "Malicious / Risky Login" if ensemble_label == 1 else "Legitimate Login",
+            "uncertainty_score": uncertainty_score,
+            "uncertainty_level": uncertainty_level,
         },
         "models": {
             "lightgbm": {
@@ -291,14 +342,27 @@ def ensemble_predict(data: dict) -> dict:
                 "weight": WEIGHTS["isolation"],
             },
         },
+        "deep_path": {
+            "triggered": deep_result["triggered"],
+            "lstm_sequential": {
+                "risk_score": deep_result["lstm_risk"],
+            },
+            "gnn_link_predictor": {
+                "risk_score": deep_result["gnn_risk"],
+            },
+        },
         "input_summary": {
             "round_trip_time_ms": data.get("round_trip_time_ms"),
             "device_type": data.get("device_type"),
             "country": data.get("country"),
             "is_attack_ip": data.get("is_attack_ip"),
             "login_successful": data.get("login_successful"),
+            "user_id": user_id,
+            "resource_id": resource_id,
         },
     }
+
+    return result
 
 
 # ===================================================================
@@ -322,6 +386,14 @@ class LoginEventRequest(BaseModel):
     city: str = Field("", description="City of the client IP")
     os_name_version: str = Field("", description="e.g. 'Mac OS X 10.14.6', 'iOS 13.4'")
     browser_name_version: str = Field("", description="e.g. 'Chrome 84.0.4147.338.339'")
+    user_id: Optional[str] = Field(
+        None,
+        description="Opaque user identifier — enables Deep Path sequential analysis",
+    )
+    resource_id: Optional[str] = Field(
+        None,
+        description="Resource being accessed — enables Deep Path behavioural models",
+    )
 
 
 # ===================================================================
@@ -383,15 +455,16 @@ async def health():
             "lightgbm": lgbm_pipeline is not None,
             "xgboost": xgb_model is not None,
             "elliptic_envelope": isolation_model is not None,
+            "lstm_sequential": lstm_scorer is not None,
+            "graphsage_link": gnn_scorer is not None,
         },
+        "deep_path_enabled": lstm_scorer is not None and gnn_scorer is not None,
     }
 
 
 # ===================================================================
-#  Flask application
+#  Interactive HTML form (served directly by FastAPI)
 # ===================================================================
-flask_app = Flask(__name__)
-
 FLASK_FORM_HTML = """
 <!DOCTYPE html>
 <html lang="en">
@@ -551,71 +624,192 @@ FLASK_FORM_HTML = """
             font-size: 1.1rem;
             margin-top: 8px;
         }
+        .auto-badge {
+            font-size: 0.7rem;
+            color: #00d2ff;
+            background: rgba(0,210,255,0.12);
+            border-radius: 4px;
+            padding: 1px 6px;
+            margin-left: 6px;
+            vertical-align: middle;
+            letter-spacing: 0.3px;
+            text-transform: none;
+            font-weight: 500;
+        }
+        input[data-auto="true"], select[data-auto="true"] {
+            border-color: rgba(0, 210, 255, 0.35);
+        }
+        @keyframes pulse-border {
+            0%, 100% { border-color: rgba(0,210,255,0.35); }
+            50%       { border-color: rgba(0,210,255,0.7); }
+        }
+        input[data-detecting="true"] {
+            animation: pulse-border 1.2s ease-in-out infinite;
+        }
+        /* Two-column form layout */
+        .two-col-form {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 0 28px;
+            align-items: start;
+        }
+        @media (max-width: 640px) { .two-col-form { grid-template-columns: 1fr; } }
+        .form-col { display: flex; flex-direction: column; gap: 16px; }
+        .col-header {
+            font-size: 0.72rem;
+            font-weight: 700;
+            letter-spacing: 1.2px;
+            text-transform: uppercase;
+            padding: 5px 10px;
+            border-radius: 6px;
+            margin-bottom: 2px;
+        }
+        .col-header.manual {
+            color: #aab4d4;
+            background: rgba(170,180,212,0.08);
+            border-left: 3px solid rgba(170,180,212,0.4);
+        }
+        .col-header.auto {
+            color: #00d2ff;
+            background: rgba(0,210,255,0.07);
+            border-left: 3px solid rgba(0,210,255,0.4);
+        }
+        /* Tooltip for field hints */
+        .field-hint {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            background: rgba(255,255,255,0.15);
+            border-radius: 50%;
+            font-size: 0.65rem;
+            text-align: center;
+            line-height: 14px;
+            cursor: default;
+            margin-left: 5px;
+            vertical-align: middle;
+            position: relative;
+        }
+        .field-hint:hover::after {
+            content: attr(data-tip);
+            position: absolute;
+            left: 50%;
+            bottom: calc(100% + 6px);
+            transform: translateX(-50%);
+            background: #1a1a2e;
+            border: 1px solid rgba(255,255,255,0.15);
+            border-radius: 6px;
+            padding: 7px 11px;
+            font-size: 0.78rem;
+            color: #ccc;
+            white-space: pre-wrap;
+            width: 220px;
+            z-index: 10;
+            pointer-events: none;
+            line-height: 1.5;
+        }
     </style>
 </head>
 <body>
 <div class="container">
     <h1>Login Risk Ensemble Predictor</h1>
-    <p class="subtitle">Powered by LightGBM + XGBoost + Elliptic Envelope anomaly detection</p>
+    <p class="subtitle">Powered by LightGBM + XGBoost + Elliptic Envelope + LSTM + GraphSAGE</p>
 
     <form id="predictionForm" class="card">
-        <div class="grid">
-            <div class="form-group">
-                <label>Round-Trip Time (ms)</label>
-                <input type="number" step="0.01" name="round_trip_time_ms" value="350" required>
+        <div class="two-col-form">
+
+            <!-- ── LEFT: Manual Input ── -->
+            <div class="form-col">
+                <div class="col-header manual">Manual Input</div>
+
+                <div class="form-group">
+                    <label>
+                        Round-Trip Time (ms)
+                        <span class="field-hint" data-tip="Network latency between the client and server (milliseconds). Unusually high RTT can indicate a VPN, Tor, or a geographically distant proxy — a common signal in account takeover attacks.">?</span>
+                    </label>
+                    <input type="number" step="0.01" name="round_trip_time_ms" value="350" required>
+                </div>
+
+                <div class="form-group">
+                    <label>
+                        ASN (Autonomous System Number)
+                        <span class="field-hint" data-tip="A unique number assigned to a network operator (e.g. Google = 15169, Cloudflare = 13335). ASNs linked to data-centers, VPNs, or bulletproof hosting correlate strongly with bot and credential-stuffing traffic.">?</span>
+                    </label>
+                    <input type="number" name="asn" value="15169" required>
+                </div>
+
+                <div class="form-group">
+                    <label>Login Successful</label>
+                    <select name="login_successful">
+                        <option value="1" selected>Yes (1)</option>
+                        <option value="0">No (0)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Is Attack IP</label>
+                    <select name="is_attack_ip">
+                        <option value="0" selected>No (0)</option>
+                        <option value="1">Yes (1)</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>User ID (Deep Path)</label>
+                    <input type="text" name="user_id" placeholder="e.g. user_42">
+                </div>
+
+                <div class="form-group">
+                    <label>Resource ID (Deep Path)</label>
+                    <input type="text" name="resource_id" placeholder="e.g. resource_7">
+                </div>
             </div>
-            <div class="form-group">
-                <label>ASN (Autonomous System Number)</label>
-                <input type="number" name="asn" value="15169" required>
+
+            <!-- ── RIGHT: Auto-Detected ── -->
+            <div class="form-col">
+                <div class="col-header auto">Auto-Detected</div>
+
+                <div class="form-group">
+                    <label>Device Type <span class="auto-badge">AUTO</span></label>
+                    <select name="device_type" data-auto="true">
+                        <option value="desktop">Desktop</option>
+                        <option value="mobile">Mobile</option>
+                        <option value="tablet">Tablet</option>
+                        <option value="bot">Bot</option>
+                        <option value="unknown" selected>Unknown</option>
+                    </select>
+                </div>
+
+                <div class="form-group">
+                    <label>Timestamp (ISO 8601) <span class="auto-badge">AUTO</span></label>
+                    <input type="datetime-local" name="timestamp" data-auto="true">
+                </div>
+
+                <div class="form-group">
+                    <label>Country <span class="auto-badge">AUTO</span></label>
+                    <input type="text" name="country" placeholder="Detecting…" data-auto="true" data-detecting="true">
+                </div>
+
+                <div class="form-group">
+                    <label>Region <span class="auto-badge">AUTO</span></label>
+                    <input type="text" name="region" placeholder="Detecting…" data-auto="true" data-detecting="true">
+                </div>
+
+                <div class="form-group">
+                    <label>City <span class="auto-badge">AUTO</span></label>
+                    <input type="text" name="city" placeholder="Detecting…" data-auto="true" data-detecting="true">
+                </div>
+
+                <div class="form-group">
+                    <label>OS Name &amp; Version <span class="auto-badge">AUTO</span></label>
+                    <input type="text" name="os_name_version" placeholder="Detecting…" data-auto="true">
+                </div>
+
+                <div class="form-group">
+                    <label>Browser Name &amp; Version <span class="auto-badge">AUTO</span></label>
+                    <input type="text" name="browser_name_version" placeholder="Detecting…" data-auto="true">
+                </div>
             </div>
-            <div class="form-group">
-                <label>Device Type</label>
-                <select name="device_type">
-                    <option value="desktop">Desktop</option>
-                    <option value="mobile">Mobile</option>
-                    <option value="tablet">Tablet</option>
-                    <option value="bot">Bot</option>
-                    <option value="unknown" selected>Unknown</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Login Successful</label>
-                <select name="login_successful">
-                    <option value="1" selected>Yes (1)</option>
-                    <option value="0">No (0)</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Is Attack IP</label>
-                <select name="is_attack_ip">
-                    <option value="0" selected>No (0)</option>
-                    <option value="1">Yes (1)</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Timestamp (ISO 8601)</label>
-                <input type="datetime-local" name="timestamp">
-            </div>
-            <div class="form-group">
-                <label>Country</label>
-                <input type="text" name="country" placeholder="e.g. US, NO, RU">
-            </div>
-            <div class="form-group">
-                <label>Region</label>
-                <input type="text" name="region" placeholder="e.g. Oslo County">
-            </div>
-            <div class="form-group">
-                <label>City</label>
-                <input type="text" name="city" placeholder="e.g. Oslo">
-            </div>
-            <div class="form-group">
-                <label>OS Name &amp; Version</label>
-                <input type="text" name="os_name_version" placeholder="e.g. Mac OS X 10.14.6">
-            </div>
-            <div class="form-group" style="grid-column:span 2;">
-                <label>Browser Name &amp; Version</label>
-                <input type="text" name="browser_name_version" placeholder="e.g. Chrome 84.0.4147.338.339">
-            </div>
+
         </div>
         <button type="submit" class="btn" id="submitBtn">Analyze Login Risk</button>
     </form>
@@ -629,6 +823,16 @@ FLASK_FORM_HTML = """
             <span class="risk-badge" id="riskBadge">—</span>
         </div>
         <p class="verdict-text" id="verdictText"></p>
+
+        <!-- Trust Entropy -->
+        <div style="display:flex;align-items:center;justify-content:center;gap:16px;margin:16px 0 8px;">
+            <div style="color:#888;font-size:0.85rem;text-transform:uppercase;">Uncertainty (Shannon Entropy)</div>
+            <span class="risk-badge" id="uncertaintyBadge" style="font-size:0.8rem;padding:5px 14px;">—</span>
+            <span style="color:#ccc;font-size:1rem;font-weight:600;" id="uncertaintyScore">—</span>
+        </div>
+
+        <!-- Fast Path models -->
+        <div style="color:#888;font-size:0.8rem;text-transform:uppercase;letter-spacing:1px;margin-top:20px;margin-bottom:8px;">Fast Path Models</div>
         <div class="model-cards">
             <div class="model-card">
                 <h3>LightGBM</h3>
@@ -649,10 +853,122 @@ FLASK_FORM_HTML = """
                 <div class="bar-outer"><div class="bar-inner" id="isoBar" style="width:0;background:#e040fb;"></div></div>
             </div>
         </div>
+
+        <!-- Deep Path models -->
+        <div id="deepPathSection" style="display:none;margin-top:20px;">
+            <div style="color:#888;font-size:0.8rem;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;">Deep Path (Detective Layer)</div>
+            <div class="model-cards" style="grid-template-columns:1fr 1fr;">
+                <div class="model-card">
+                    <h3>LSTM Sequential</h3>
+                    <div class="prob" id="lstmProb">—</div>
+                    <div class="weight">Anomaly Risk</div>
+                    <div class="bar-outer"><div class="bar-inner" id="lstmBar" style="width:0;background:#ff6f00;"></div></div>
+                </div>
+                <div class="model-card">
+                    <h3>GraphSAGE Link</h3>
+                    <div class="prob" id="gnnProb">—</div>
+                    <div class="weight">Link Anomaly Risk</div>
+                    <div class="bar-outer"><div class="bar-inner" id="gnnBar" style="width:0;background:#ab47bc;"></div></div>
+                </div>
+            </div>
+        </div>
     </div>
 </div>
 
 <script>
+/* ── Auto-detection helpers ───────────────────────────────────────────── */
+
+function detectDevice() {
+    const w = window.screen.width;
+    const h = window.screen.height;
+    const ratio = w / h;
+    // Portrait-oriented or very narrow → phone
+    if (w < 768 || ratio < 0.65) return 'mobile';
+    // Mid-range width or squarish ratio → tablet
+    if (w < 1024 || ratio < 1.0) return 'tablet';
+    return 'desktop';
+}
+
+function detectOS(ua) {
+    if (/iPad/.test(ua) && /OS ([\d_]+)/.test(ua))
+        return 'iPadOS ' + RegExp.$1.replace(/_/g, '.');
+    if (/iPhone OS ([\d_]+)/.test(ua))
+        return 'iOS ' + RegExp.$1.replace(/_/g, '.');
+    if (/Android ([\d.]+)/.test(ua))
+        return 'Android ' + RegExp.$1;
+    if (/Windows NT ([\d.]+)/.test(ua))
+        return 'Windows ' + RegExp.$1;
+    if (/Mac OS X ([\d_]+)/.test(ua))
+        return 'Mac OS X ' + RegExp.$1.replace(/_/g, '.');
+    if (/CrOS/.test(ua))
+        return 'Chrome OS';
+    if (/Linux/.test(ua))
+        return 'Linux';
+    return '';
+}
+
+function detectBrowser(ua) {
+    // Order matters: check specific tokens before generic ones
+    if (/Edg\/([\d.]+)/.test(ua))             return 'Edge ' + RegExp.$1;
+    if (/OPR\/([\d.]+)/.test(ua))             return 'Opera ' + RegExp.$1;
+    if (/SamsungBrowser\/([\d.]+)/.test(ua))  return 'Samsung Browser ' + RegExp.$1;
+    if (/Chrome\/([\d.]+)/.test(ua))          return 'Chrome ' + RegExp.$1;
+    if (/Firefox\/([\d.]+)/.test(ua))         return 'Firefox ' + RegExp.$1;
+    if (/Version\/([\d.]+).*Safari/.test(ua)) return 'Safari ' + RegExp.$1;
+    return '';
+}
+
+async function detectLocation() {
+    try {
+        const res = await fetch('https://ipapi.co/json/');
+        if (!res.ok) throw new Error('geo fetch failed');
+        const d = await res.json();
+        const countryEl = document.querySelector('[name=country]');
+        const regionEl  = document.querySelector('[name=region]');
+        const cityEl    = document.querySelector('[name=city]');
+        countryEl.value = d.country_code || '';
+        regionEl.value  = d.region       || '';
+        cityEl.value    = d.city         || '';
+        // Stop pulsing animation once data arrives
+        [countryEl, regionEl, cityEl].forEach(el => {
+            el.removeAttribute('data-detecting');
+            el.placeholder = '';
+        });
+    } catch (_) {
+        ['country','region','city'].forEach(name => {
+            const el = document.querySelector('[name=' + name + ']');
+            el.removeAttribute('data-detecting');
+            el.placeholder = 'e.g. ' + (name === 'country' ? 'US' : name === 'region' ? 'California' : 'San Jose');
+        });
+    }
+}
+
+document.addEventListener('DOMContentLoaded', function () {
+    const ua = navigator.userAgent;
+
+    // Device type
+    const deviceSel = document.querySelector('[name=device_type]');
+    deviceSel.value = detectDevice();
+
+    // Timestamp — current local time in datetime-local format (YYYY-MM-DDTHH:MM)
+    const now = new Date();
+    const localISO = new Date(now.getTime() - now.getTimezoneOffset() * 60000)
+        .toISOString().slice(0, 16);
+    document.querySelector('[name=timestamp]').value = localISO;
+
+    // OS and Browser from User-Agent (synchronous)
+    const osEl = document.querySelector('[name=os_name_version]');
+    const brEl = document.querySelector('[name=browser_name_version]');
+    osEl.value = detectOS(ua);
+    brEl.value = detectBrowser(ua);
+    osEl.placeholder = '';
+    brEl.placeholder = '';
+
+    // Country / Region / City from IP geolocation (async)
+    detectLocation();
+});
+
+/* ── Form submit handler ──────────────────────────────────────────────── */
 document.getElementById('predictionForm').addEventListener('submit', async function(e) {
     e.preventDefault();
     const btn = document.getElementById('submitBtn');
@@ -666,7 +982,9 @@ document.getElementById('predictionForm').addEventListener('submit', async funct
             body[k] = Number(v);
         else if (k === 'timestamp' && v)
             body[k] = new Date(v).toISOString();
-        else if (k !== 'timestamp')
+        else if (k === 'timestamp' && !v)
+            { /* skip empty timestamp */ }
+        else if (v)
             body[k] = v;
     });
 
@@ -703,6 +1021,29 @@ document.getElementById('predictionForm').addEventListener('submit', async funct
         document.getElementById('isoWeight').textContent = 'Weight: ' + m.elliptic_envelope.weight;
         document.getElementById('isoBar').style.width = (m.elliptic_envelope.risk_probability * 100) + '%';
 
+        // Trust Entropy
+        const uScore = ens.uncertainty_score;
+        const uLevel = ens.uncertainty_level;
+        document.getElementById('uncertaintyScore').textContent = (uScore * 100).toFixed(1) + '%';
+        const uBadge = document.getElementById('uncertaintyBadge');
+        uBadge.textContent = uLevel;
+        uBadge.className = 'risk-badge risk-' + (uLevel === 'High' ? 'High' : uLevel === 'Medium' ? 'Medium' : 'Low');
+
+        // Deep Path
+        const dp = data.deep_path;
+        const dpSection = document.getElementById('deepPathSection');
+        if (dp && dp.triggered) {
+            dpSection.style.display = 'block';
+            const lstmRisk = dp.lstm_sequential.risk_score;
+            const gnnRisk = dp.gnn_link_predictor.risk_score;
+            document.getElementById('lstmProb').textContent = lstmRisk !== null ? (lstmRisk * 100).toFixed(1) + '%' : 'N/A';
+            document.getElementById('lstmBar').style.width = lstmRisk !== null ? (lstmRisk * 100) + '%' : '0%';
+            document.getElementById('gnnProb').textContent = gnnRisk !== null ? (gnnRisk * 100).toFixed(1) + '%' : 'N/A';
+            document.getElementById('gnnBar').style.width = gnnRisk !== null ? (gnnRisk * 100) + '%' : '0%';
+        } else {
+            dpSection.style.display = 'none';
+        }
+
         document.getElementById('results').scrollIntoView({behavior: 'smooth'});
     } catch (err) {
         alert('Prediction failed: ' + err.message);
@@ -717,29 +1058,21 @@ document.getElementById('predictionForm').addEventListener('submit', async funct
 """
 
 
-@flask_app.route("/")
-def flask_home():
-    return render_template_string(FLASK_FORM_HTML)
+@fastapi_app.get("/flask/", response_class=HTMLResponse)
+@fastapi_app.get("/flask", response_class=HTMLResponse, include_in_schema=False)
+async def flask_home():
+    return HTMLResponse(content=FLASK_FORM_HTML)
 
 
-@flask_app.route("/predict", methods=["POST"])
-def flask_predict():
-    """Flask JSON prediction endpoint."""
+@fastapi_app.post("/flask/predict")
+async def flask_predict(request: Request):
+    """HTML-form JSON prediction endpoint (mirrors the original Flask route)."""
     try:
-        data = flask_request.get_json(force=True)
+        data = await request.json()
         result = ensemble_predict(data)
-        return jsonify(result)
+        return JSONResponse(content=result)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
-
-
-# ===================================================================
-#  Mount Flask inside FastAPI via ASGI/WSGI adapter
-# ===================================================================
-from asgiref.wsgi import WsgiToAsgi
-
-flask_asgi = WsgiToAsgi(flask_app.wsgi_app)
-fastapi_app.mount("/flask", flask_asgi)
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ===================================================================
@@ -753,4 +1086,4 @@ if __name__ == "__main__":
     print("  FastAPI  -> http://127.0.0.1:8000")
     print("  Swagger  -> http://127.0.0.1:8000/docs")
     print("  Flask UI -> http://127.0.0.1:8000/flask/\n")
-    uvicorn.run("app:fastapi_app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(fastapi_app, host="0.0.0.0", port=8000)
