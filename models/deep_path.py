@@ -26,6 +26,8 @@ BLEND_WEIGHT_GNN = 0.15
 
 def should_trigger_deep_path(fast_path_score: float) -> bool:
     """Return ``True`` when the fast-path score is in the Medium band."""
+    if fast_path_score is None:
+        return False
     return DEEP_PATH_LOW < fast_path_score < DEEP_PATH_HIGH
 
 
@@ -36,6 +38,7 @@ def run_deep_path(
     device_type: str,
     lstm_scorer,
     gnn_scorer,
+    activity_sequence: Optional[list] = None,
 ) -> dict:
     """
     Conditionally execute the Deep Path models.
@@ -55,6 +58,8 @@ def run_deep_path(
         Loaded LSTM scorer instance (``None`` when model files are absent).
     gnn_scorer : GNNLinkScorer or None
         Loaded GNN scorer instance (``None`` when model files are absent).
+    activity_sequence : list or None
+        User's recent activity sequence for behavioral analysis.
 
     Returns
     -------
@@ -62,6 +67,8 @@ def run_deep_path(
         triggered : bool
         lstm_risk  : float or None
         gnn_risk   : float or None
+        sequence_risk : float or None  (LSTM sequence anomaly score)
+        relational_risk : float or None (GNN relational score)
         blended_score : float or None   (only when triggered)
     """
     if (
@@ -75,21 +82,28 @@ def run_deep_path(
             "triggered": False,
             "lstm_risk": None,
             "gnn_risk": None,
+            "sequence_risk": None,
+            "relational_risk": None,
             "blended_score": None,
         }
 
-    lstm_risk = lstm_scorer.score(user_id, resource_id)
-    gnn_risk = gnn_scorer.score(user_id, device_type, resource_id)
+    # LSTM sequential analysis - calculate sequence anomaly risk
+    sequence_risk = lstm_scorer.score(user_id, resource_id, activity_sequence)
+    
+    # GNN relational analysis - score user-device-resource relationship
+    relational_risk = gnn_scorer.score(user_id, device_type, resource_id)
 
     blended = (
         BLEND_WEIGHT_FAST * fast_path_score
-        + BLEND_WEIGHT_LSTM * lstm_risk
-        + BLEND_WEIGHT_GNN * gnn_risk
+        + BLEND_WEIGHT_LSTM * sequence_risk
+        + BLEND_WEIGHT_GNN * relational_risk
     )
 
     return {
         "triggered": True,
-        "lstm_risk": round(lstm_risk, 4),
-        "gnn_risk": round(gnn_risk, 4),
+        "lstm_risk": round(sequence_risk, 4),
+        "gnn_risk": round(relational_risk, 4),
+        "sequence_risk": round(sequence_risk, 4),
+        "relational_risk": round(relational_risk, 4),
         "blended_score": round(blended, 4),
     }
