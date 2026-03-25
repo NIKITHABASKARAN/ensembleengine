@@ -43,8 +43,8 @@ export function LiveActivityPulse({ events }: LiveActivityPulseProps) {
 
   return (
     <div className="h-full flex flex-col">
-      <GlassCard className="flex-1 flex flex-col" glow="magenta">
-        <div className="mb-6">
+      <GlassCard className="flex-1 flex flex-col overflow-hidden" glow="magenta">
+        <div className="shrink-0 mb-4">
           <div className="flex items-center gap-3 mb-2">
             <Activity className="w-6 h-6 text-pink-400" />
             <h2 className="text-xl font-bold text-pink-300">Live Activity Pulse</h2>
@@ -54,7 +54,7 @@ export function LiveActivityPulse({ events }: LiveActivityPulseProps) {
           </p>
         </div>
 
-        <div className="flex-1 overflow-y-auto space-y-3 pr-2 scrollbar-thin scrollbar-thumb-slate-700 scrollbar-track-transparent">
+        <div className="flex-1 min-h-0 overflow-y-auto space-y-3 pr-2">
           {events.length === 0 ? (
             <div className="flex items-center justify-center h-full text-slate-500">
               <div className="text-center">

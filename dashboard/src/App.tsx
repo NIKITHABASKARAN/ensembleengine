@@ -62,22 +62,22 @@ function App() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
+    <div className="h-screen overflow-hidden bg-gradient-to-br from-slate-950 via-slate-900 to-slate-950">
       <div className="absolute inset-0 bg-[url('data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iNjAiIGhlaWdodD0iNjAiIHZpZXdCb3g9IjAgMCA2MCA2MCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSJub25lIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxwYXRoIGQ9Ik0zNiAxOGMzLjMxIDAgNiAyLjY5IDYgNnMtMi42OSA2LTYgNi02LTIuNjktNi02IDIuNjktNiA2LTZ6IiBzdHJva2U9IiMxZTI5M2IiIHN0cm9rZS13aWR0aD0iMC41IiBvcGFjaXR5PSIwLjMiLz48L2c+PC9zdmc+')] opacity-20"></div>
 
-      <div className="relative z-10 container mx-auto px-6 py-8">
-        <header className="mb-8">
+      <div className="relative z-10 h-full flex flex-col container mx-auto px-6 py-6">
+        <header className="shrink-0 mb-6">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-4">
               <div className="relative">
-                <Shield className="w-12 h-12 text-cyan-400" />
+                <Shield className="w-10 h-10 text-cyan-400" />
                 <div className="absolute inset-0 bg-cyan-400/20 blur-xl animate-pulse"></div>
               </div>
               <div>
-                <h1 className="text-4xl font-bold bg-gradient-to-r from-cyan-300 via-blue-300 to-purple-300 bg-clip-text text-transparent">
+                <h1 className="text-3xl font-bold bg-gradient-to-r from-cyan-300 via-blue-300 to-purple-300 bg-clip-text text-transparent">
                   Cyberpunk Security Ops
                 </h1>
-                <p className="text-slate-400 text-sm mt-1">
+                <p className="text-slate-400 text-sm">
                   Real-time Threat Detection & Neural Analysis Platform
                 </p>
               </div>
@@ -105,24 +105,24 @@ function App() {
           </div>
         </header>
 
-        <div className="grid grid-cols-12 gap-6 h-[calc(100vh-180px)]">
-          <div className={`col-span-3 transition-all duration-500 ${getHighlightClass('persona')}`}>
+        <div className="grid grid-cols-12 gap-6 flex-1 min-h-0">
+          <div className={`col-span-3 min-h-0 transition-all duration-500 ${getHighlightClass('persona')}`}>
             <PersonaSimulator
               activePersona={activePersona}
               onPersonaChange={handlePersonaChange}
             />
           </div>
 
-          <div className={`col-span-4 transition-all duration-500 ${getHighlightClass('activity')}`}>
+          <div className={`col-span-4 min-h-0 transition-all duration-500 ${getHighlightClass('activity')}`}>
             <LiveActivityPulse events={events} />
           </div>
 
-          <div className="col-span-5 flex flex-col gap-6">
-            <div className={`flex-1 transition-all duration-500 ${getHighlightClass('neural')}`}>
+          <div className="col-span-5 min-h-0 overflow-y-auto flex flex-col gap-6">
+            <div className={`shrink-0 transition-all duration-500 ${getHighlightClass('neural')}`}>
               <NeuralAnalysis analysis={currentAnalysis} />
             </div>
 
-            <div className="grid grid-cols-2 gap-6">
+            <div className={`shrink-0 grid gap-6 ${currentAnalysis?.travel_anomaly ? 'grid-cols-2' : 'grid-cols-1'}`}>
               <TrustEntropyGauge entropy={currentAnalysis?.entropy || 0} />
               {currentAnalysis?.travel_anomaly && (
                 <GeographicVelocity travelAnomaly={currentAnalysis.travel_anomaly} />

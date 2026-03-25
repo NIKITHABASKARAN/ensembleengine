@@ -311,8 +311,9 @@ def ensemble_predict(data: dict, activity_sequence: list = None, force_deep_path
                 activity_sequence  # positional arg 7 (new)
             )
             if deep_result["triggered"] or force_deep_path:
-                deep_path_prob = deep_result.get("blended_score", fast_path_score if fast_path_score is not None else 0.0)
-                deep_path_label = int((deep_path_prob or 0) >= 0.5)
+                _blended = deep_result.get("blended_score")
+                deep_path_prob = _blended if _blended is not None else (fast_path_score if fast_path_score is not None else 0.0)
+                deep_path_label = int(deep_path_prob >= 0.5)
                 deep_path_details = deep_result
             else:
                 # Deep path not triggered, use fast path score
