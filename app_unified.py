@@ -1,6 +1,7 @@
 import os
 import pickle
 import warnings
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 import time
@@ -24,26 +25,6 @@ from models.lstm_sequential import load_lstm_scorer
 from models.gnn_link_predictor import load_gnn_scorer
 
 warnings.filterwarnings("ignore")
-
-# =========================================================================
-# CRITICAL PATCH: Handle StringDtype compatibility (pandas 1.x -> 2.x)
-# =========================================================================
-_original_stringdtype_new = pd.StringDtype.__new__
-_original_stringdtype_init = pd.StringDtype.__init__
-
-def _new_stringdtype(cls, *args, **kwargs):
-    instance = object.__new__(cls)
-    return instance
-
-def _new_stringdtype_init(self, storage="python", na_value=pd.NA, *args, **kwargs):
-    if not hasattr(self, 'storage'):
-        try:
-            _original_stringdtype_init(self, storage=storage)
-        except:
-            object.__setattr__(self, 'storage', storage)
-
-pd.StringDtype.__new__ = staticmethod(_new_stringdtype)
-pd.StringDtype.__init__ = _new_stringdtype_init
 
 # ---------------------------------------------------------------------------
 # LoginRiskPipeline stub (needed to unpickle login_risk_model.pkl)
@@ -70,23 +51,14 @@ def _load_models():
 
     return lgbm_pipeline, xgb_model, isolation_model
 
-lgbm_pipeline, xgb_model, isolation_model = _load_models()
-init_db()
 
-# ---------------------------------------------------------------------------
-# Deep Path model loading (graceful — returns None if artefacts missing)
-# ---------------------------------------------------------------------------
-lstm_scorer = load_lstm_scorer(BASE_DIR)
-gnn_scorer = load_gnn_scorer(BASE_DIR)
-
-if lstm_scorer and gnn_scorer:
-    print("[Deep Path] LSTM + GraphSAGE models loaded successfully.")
-elif lstm_scorer:
-    print("[Deep Path] Only LSTM loaded (GraphSAGE artefacts missing).")
-elif gnn_scorer:
-    print("[Deep Path] Only GraphSAGE loaded (LSTM artefacts missing).")
-else:
-    print("[Deep Path] No deep-path models found — detective layer disabled.")
+# Loaded in FastAPI lifespan so import/uvicorn bind even if joblib unpickle fails (e.g. pandas/sklearn mismatch).
+lgbm_pipeline: Optional[object] = None
+xgb_model: Optional[object] = None
+isolation_model: Optional[object] = None
+lstm_scorer: Optional[object] = None
+gnn_scorer: Optional[object] = None
+model_load_error: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Feature engineering helpers (replicates LoginRiskPipeline preprocessing)
@@ -522,6 +494,34 @@ SCENARIOS = {
 # ===================================================================
 #  FastAPI application
 # ===================================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global lgbm_pipeline, xgb_model, isolation_model, lstm_scorer, gnn_scorer, model_load_error
+    init_db()
+    try:
+        lgbm_pipeline, xgb_model, isolation_model = _load_models()
+        model_load_error = None
+        print("[Models] Fast-path ensemble loaded.")
+    except Exception as e:
+        model_load_error = f"{type(e).__name__}: {e}"
+        lgbm_pipeline = None
+        xgb_model = None
+        isolation_model = None
+        print(f"[Models] Fast-path ensemble FAILED (server still listens on :8000): {model_load_error}")
+
+    lstm_scorer = load_lstm_scorer(BASE_DIR)
+    gnn_scorer = load_gnn_scorer(BASE_DIR)
+    if lstm_scorer and gnn_scorer:
+        print("[Deep Path] LSTM + GraphSAGE models loaded successfully.")
+    elif lstm_scorer:
+        print("[Deep Path] Only LSTM loaded (GraphSAGE artefacts missing).")
+    elif gnn_scorer:
+        print("[Deep Path] Only GraphSAGE loaded (LSTM artefacts missing).")
+    else:
+        print("[Deep Path] No deep-path models found — detective layer disabled.")
+    yield
+
+
 fastapi_app = FastAPI(
     title="Unified Zero Trust Login Risk PDP",
     description=(
@@ -529,6 +529,7 @@ fastapi_app = FastAPI(
         "stateful tracking, impossible travel detection, and OPA enforcement."
     ),
     version="2.0.0",
+    lifespan=lifespan,
 )
 
 fastapi_app.add_middleware(
@@ -624,12 +625,27 @@ def query_opa(risk_score: float, entropy: float,
             return ("MFA", "fallback_mfa_untrusted_device")
         return ("ALLOW", "fallback_allow")
 
+
+def _ensure_models_loaded() -> None:
+    if lgbm_pipeline is None or xgb_model is None or isolation_model is None:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "error": "ensemble_models_unavailable",
+                "message": "Main ML models did not load at startup. Open GET /health for model_load_error.",
+                "load_error": model_load_error,
+                "fix": "Use Python 3.11+ or align pandas/sklearn with the training environment; see requirements.txt",
+            },
+        )
+
+
 @fastapi_app.post("/predict")
 async def fastapi_predict(event: AccessRequest):
     """
     Enhanced prediction endpoint with stateful tracking, deep path analysis, and OPA enforcement.
     """
     try:
+        _ensure_models_loaded()
         data = event.model_dump()
         
         # Extract stateful fields — keep them separate from ML input
@@ -725,14 +741,18 @@ async def fastapi_predict(event: AccessRequest):
         }
         
         return JSONResponse(content=result)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
 @fastapi_app.get("/health")
 async def health():
     """Enhanced health check with deep path model status."""
+    core_ok = lgbm_pipeline is not None and xgb_model is not None and isolation_model is not None
     return {
-        "status": "healthy",
+        "status": "healthy" if core_ok else "degraded",
+        "model_load_error": model_load_error,
         "models_loaded": {
             "lightgbm": lgbm_pipeline is not None,
             "xgboost": xgb_model is not None,
@@ -753,6 +773,7 @@ async def health():
 @fastapi_app.post("/simulate")
 async def simulate(body: dict):
     """Enhanced simulation orchestrator with deep path analysis."""
+    _ensure_models_loaded()
     scenario_id = body.get("scenario_id", "Normal_Baseline")
     count = min(int(body.get("count", 5)), 10)
 
@@ -1187,6 +1208,14 @@ def flask_home():
 def flask_predict():
     """Flask JSON prediction endpoint with enhanced features."""
     try:
+        if lgbm_pipeline is None or xgb_model is None or isolation_model is None:
+            return jsonify(
+                {
+                    "error": "ensemble_models_unavailable",
+                    "load_error": model_load_error,
+                    "fix": "Use Python 3.11+ or fix pandas/sklearn; see GET /health",
+                }
+            ), 503
         data = flask_request.get_json(force=True)
         
         # Extract stateful fields — keep them separate from ML input

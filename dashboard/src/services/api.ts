@@ -1,6 +1,27 @@
 import { PersonaType, NeuralAnalysisResponse, SecurityEvent } from '../types';
 
-const API_BASE_URL = 'http://localhost:8000';
+/**
+ * Base URL for the ensemble API.
+ * - Dev: `/api` is proxied to FastAPI (see vite.config.js) — avoids CORS and matches app_unified.py.
+ * - Prod: set VITE_API_BASE_URL (e.g. http://127.0.0.1:8000) at build time.
+ */
+export function getApiBaseUrl(): string {
+  const fromEnv = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (fromEnv) return fromEnv.replace(/\/$/, '');
+  return import.meta.env.DEV ? '/api' : 'http://127.0.0.1:8000';
+}
+
+const API_BASE_URL = getApiBaseUrl();
+
+/** True when FastAPI (e.g. app_unified.py) is reachable at the configured base URL. */
+export async function checkApiHealth(): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/health`, { method: 'GET' });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
 
 // Map persona types to backend scenario IDs
 const personaToScenario: Record<PersonaType, string> = {
@@ -28,17 +49,20 @@ export async function analyzeSecurityEvent(
     });
 
     if (!response.ok) {
-      throw new Error(`API request failed: ${response.statusText}`);
+      const detail = await response.text().catch(() => '');
+      throw new Error(
+        `API request failed: ${response.status} ${response.statusText}${detail ? ` — ${detail.slice(0, 200)}` : ''}`
+      );
     }
 
     const data = await response.json();
-    
+
     if (data.results && data.results.length > 0) {
       const result = data.results[0].result;
       return transformBackendResponse(result, persona);
     }
-    
-    return generateMockAnalysis(persona);
+
+    throw new Error('Simulate response missing results[]');
   } catch (error) {
     console.error('API Error:', error);
     return generateMockAnalysis(persona);
@@ -49,12 +73,21 @@ export async function analyzeSecurityEvent(
 function transformBackendResponse(result: any, persona: PersonaType): NeuralAnalysisResponse {
   const ensemble = result.ensemble || {};
   const models = result.models || {};
-  const deepPath = result.deep_path || {};
   const input = result.input_summary || {};
-  
+
+  // app_unified.py nests deep-path state under models.deep_path.details; app.py used top-level deep_path.
+  const dpModel = models.deep_path;
+  const deepDetails = dpModel?.details ?? {};
+  const deepTriggered = Boolean(deepDetails.triggered);
+
   const riskScore = ensemble.risk_score || 0;
-  const entropy = result.entropy || 0;
-  
+  const entropy =
+    typeof result.entropy === 'number'
+      ? result.entropy
+      : typeof ensemble.uncertainty_score === 'number'
+        ? ensemble.uncertainty_score
+        : 0;
+
   // Map backend verdict to frontend
   let verdict: 'ALLOW' | 'MFA' | 'DENY';
   switch (result.verdict) {
@@ -73,7 +106,7 @@ function transformBackendResponse(result: any, persona: PersonaType): NeuralAnal
 
   // Determine processing stage
   let processingStage: 'fast_path' | 'deep_path' | 'opa_enforcement';
-  if (deepPath.triggered) {
+  if (deepTriggered) {
     processingStage = 'deep_path';
   } else if (verdict === 'DENY') {
     processingStage = 'opa_enforcement';
@@ -81,18 +114,21 @@ function transformBackendResponse(result: any, persona: PersonaType): NeuralAnal
     processingStage = 'fast_path';
   }
 
+  const dpWeight = typeof dpModel?.weight === 'number' ? dpModel.weight : 0;
+  const deepHalf = deepTriggered ? (dpWeight > 0 ? dpWeight / 2 : 0.075) : 0;
+
   return {
     verdict,
     risk_score: riskScore,
     entropy,
     ensemble_weights: {
-      lgbm: models.lightgbm?.weight || 0.45,
-      xgb: models.xgboost?.weight || 0.35,
-      iso: models.elliptic_envelope?.weight || 0.20,
-      lstm: deepPath.triggered ? 0.15 : 0,
-      gnn: deepPath.triggered ? 0.15 : 0,
+      lgbm: models.lightgbm?.weight ?? 0.45,
+      xgb: models.xgboost?.weight ?? 0.35,
+      iso: models.elliptic_envelope?.weight ?? 0.20,
+      lstm: deepHalf,
+      gnn: deepHalf,
     },
-    deep_path: deepPath.triggered || false,
+    deep_path: deepTriggered,
     behavioral_analysis: {
       typing_cadence: persona === 'credential_stuffing' ? 0.05 : 0.65 + Math.random() * 0.2,
       mouse_velocity: persona === 'credential_stuffing' ? 0.02 : 0.55 + Math.random() * 0.3,

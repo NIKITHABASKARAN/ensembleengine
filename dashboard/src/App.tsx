@@ -9,7 +9,7 @@ import { GeographicVelocity } from './components/GeographicVelocity';
 import { BiometricScanAnimation } from './components/BiometricScanAnimation';
 import { GuidedDemoMode } from './components/GuidedDemoMode';
 import { NeonButton } from './components/ui/NeonButton';
-import { analyzeSecurityEvent, createSecurityEvent } from './services/api';
+import { analyzeSecurityEvent, checkApiHealth, createSecurityEvent, getApiBaseUrl } from './services/api';
 
 function App() {
   const [activePersona, setActivePersona] = useState<PersonaType>('normal');
@@ -19,6 +19,17 @@ function App() {
   const [isSimulationRunning, setIsSimulationRunning] = useState(false);
   const [showGuidedDemo, setShowGuidedDemo] = useState(false);
   const [demoHighlight, setDemoHighlight] = useState<'persona' | 'activity' | 'neural' | null>(null);
+  const [apiOnline, setApiOnline] = useState<boolean | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    checkApiHealth().then((ok) => {
+      if (!cancelled) setApiOnline(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const handlePersonaChange = async (persona: PersonaType) => {
     setActivePersona(persona);
@@ -79,6 +90,34 @@ function App() {
                 </h1>
                 <p className="text-slate-400 text-sm mt-1">
                   Real-time Threat Detection & Neural Analysis Platform
+                </p>
+                <p className="text-slate-500 text-xs mt-2 flex flex-wrap items-center gap-2">
+                  <span
+                    className={`inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 font-medium ${
+                      apiOnline === null
+                        ? 'bg-slate-800 text-slate-400'
+                        : apiOnline
+                          ? 'bg-emerald-950/80 text-emerald-400'
+                          : 'bg-amber-950/80 text-amber-400'
+                    }`}
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full ${
+                        apiOnline === null
+                          ? 'bg-slate-500 animate-pulse'
+                          : apiOnline
+                            ? 'bg-emerald-400'
+                            : 'bg-amber-400'
+                      }`}
+                    />
+                    {apiOnline === null
+                      ? 'Checking API…'
+                      : apiOnline
+                        ? 'Ensemble API connected'
+                        : 'API offline — simulations use demo data (run python app_unified.py)'}
+                  </span>
+                  <span className="text-slate-600">·</span>
+                  <span className="font-mono text-slate-500">{getApiBaseUrl()}</span>
                 </p>
               </div>
             </div>
